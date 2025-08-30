@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>蒼穹のリバーブ - 単一HTML（安定版：Worklet+Fallback+フルUI）</title>
+<style>
+:root{--bg:#0f1116;--fg:#e5e7eb;--fg2:#c7cad1;--accent:#79c0ff;--sub:#9ef0a8;--warn:#ffb86c;--panel:#151924;--panel2:#121521;--muted:#2a3245}
+*{box-sizing:border-box}html,body{height:100%;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,Segoe UI,Helvetica,Arial,sans-serif}
+h1{font-size:18px;margin:8px 0 12px}small,.hint{color:var(--fg2)}
+.wrap{display:grid;grid-template-columns:420px 1fr;gap:12px;padding:12px;max-width:1500px;margin:auto}
+@media (max-width:980px){.wrap{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid #1f2637;border-radius:10px;padding:10px;box-shadow:0 10px 20px rgba(0,0,0,.15)}
+.row{display:flex;align-items:center;gap:8px;margin:6px 0}.row>label{flex:1}.row input[type="range"]{flex:2}.row input[type="number"]{width:80px}.row select{flex:1}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.btn{cursor:pointer;border:1px solid var(--muted);background:#131826;color:#e5e7eb;padding:6px 10px;border-radius:8px}.btn:hover{border-color:#3a4766}
+.switch{display:inline-flex;align-items:center;gap:6px}.switch input{accent-color:var(--accent)}
+.value{min-width:56px;text-align:right;color:var(--fg2)}
+.meters{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+canvas{width:100%;height:140px;background:#0c0f17;border:1px solid #26314e;border-radius:8px}
+.status{display:flex;align-items:center;gap:10px;color:#cfe4ff}.status .dot{width:10px;height:10px;border-radius:50%}
+.dot.ok{background:var(--sub)}.dot.bad{background:#ff7b7b}.io{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.drop{border:1px dashed #3a4766;border-radius:10px;padding:10px;color:#bcd;border-color:#48608d;background:#0f1523}
+.kbd{display:inline-block;padding:1px 6px;border:1px solid #394868;border-radius:6px;background:#0e1726;color:#d7e6ff;font-size:12px}
+.section{margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="card">
+    <h1>蒼穹のリバーブ（独自実装 / Hybrid Early + 8FDN + Shimmer）</h1>
+    <div class="status"><span id="workletDot" class="dot bad"></span><span id="workletStatus">初期化待機…（入力開始で安全に初期化）</span></div>
+    <div id="errlog" class="hint" style="margin-top:6px;white-space:pre-wrap"></div>
+
+    <div class="card section">
+      <div class="io">
+        <label>入力デバイス</label>
+        <select id="deviceId" style="min-width:220px"></select>
+        <button class="btn" id="refreshDevs" title="デバイス再スキャン">更新</button>
+        <strong>I/O</strong>
+        <label class="switch"><input type="radio" name="src" id="srcMic" checked>マイク</label>
+        <label class="switch"><input type="radio" name="src" id="srcFile">ファイル</label>
+        <button class="btn" id="btnStart">入力開始</button>
+        <button class="btn" id="btnStop">停止</button>
+        <button class="btn" id="btnReinit" title="グラフ/Worklet再初期化">再初期化</button>
+      </div>
+      <div class="row">
+        <div class="drop" id="drop">ここに音声ファイルをドラッグ&ドロップ / クリック選択<input type="file" id="file" accept="audio/*" style="display:none"></div>
+      </div>
+      <small class="hint">
+        ・最新版Chromeでは file:// でも許可ダイアログでマイクが使える場合あり（環境依存）。<br>
+        ・動かない場合は localhost / Firefox をお試しください。<br>
+        ・ショートカット：<span class="kbd">Space</span>=Bypass、<span class="kbd">R</span>=録音、<span class="kbd">S</span>=Shimmer、<span class="kbd">1–5</span>=プリセット
+      </small>
+    </div>
+
+    <div class="card section">
+      <div class="grid2">
+        <div class="row switch"><input type="checkbox" id="bypass"> <label for="bypass">Bypass</label></div>
+        <div class="row switch"><input type="checkbox" id="wetOnly"> <label for="wetOnly">Wet Only</label></div>
+      </div>
+      <div class="row"><label>Mix</label><input type="range" id="mix" min="0" max="1" step="0.001"><div class="value" id="vmix"></div></div>
+      <div class="row"><label>Decay (T60 s)</label><input type="range" id="decay" min="0.3" max="15" step="0.01"><div class="value" id="vdecay"></div></div>
+      <div class="row"><label>Pre-Delay (ms)</label><input type="range" id="predelay" min="0" max="120" step="1"><div class="value" id="vpredelay"></div></div>
+      <div class="grid3">
+        <div class="row switch"><input type="checkbox" id="tempoSync"> <label for="tempoSync">テンポ同期</label></div>
+        <div class="row"><label>BPM</label><input type="number" id="bpm" min="20" max="300" step="1"></div>
+        <div class="row">
+          <label>Division</label>
+          <select id="division">
+            <option value="1/4">1/4</option>
+            <option value="1/8" selected>1/8</option>
+            <option value="1/8.">付点1/8</option>
+            <option value="1/8t">三連1/8</option>
+          </select>
+        </div>
+      </div>
+      <div class="row"><button class="btn" id="tap">TAP</button><small class="hint">4回以上タップでBPM検出</small></div>
+
+      <div class="row"><label>Low Damp (dB @150Hz)</label><input type="range" id="lowDamp" min="-12" max="12" step="0.1"><div class="value" id="vlowDamp"></div></div>
+      <div class="row"><label>High Damp (dB)</label><input type="range" id="highDamp" min="-12" max="12" step="0.1"><div class="value" id="vhighDamp"></div></div>
+      <div class="row"><label>High Damp Cutoff (Hz)</label><input type="range" id="highCut" min="3000" max="10000" step="10"><div class="value" id="vhighCut"></div></div>
+
+      <div class="row"><label>Mod Depth (ms)</label><input type="range" id="modDepth" min="0" max="10" step="0.01"><div class="value" id="vmodDepth"></div></div>
+      <div class="row"><label>Mod Rate (Hz)</label><input type="range" id="modRate" min="0.05" max="1.5" step="0.01"><div class="value" id="vmodRate"></div></div>
+      <div class="row"><label>Stereo Width</label><input type="range" id="width" min="0" max="1" step="0.01"><div class="value" id="vwidth"></div></div>
+      <div class="row"><label>HPF (Hz)</label><input type="range" id="hpf" min="20" max="200" step="1"><div class="value" id="vhpf"></div></div>
+
+      <div class="grid2" style="margin-top:8px">
+        <div class="row switch"><input type="checkbox" id="shimmerOn"> <label for="shimmerOn">Shimmer</label></div>
+        <div class="row"><label>Shimmer Amount</label><input type="range" id="shimmerAmt" min="0" max="0.5" step="0.001"><div class="value" id="vshimmerAmt"></div></div>
+        <div class="row">
+          <label>Interval</label>
+          <select id="shimmerInt">
+            <option value="12">+12 st</option>
+            <option value="7">+7 st</option>
+            <option value="5">+5 st</option>
+            <option value="-12">-12 st</option>
+            <option value="-7">-7 st</option>
+            <option value="-5">-5 st</option>
+          </select>
+        </div>
+        <div class="row"><label>Shimmer Mix (wetのみ)</label><input type="range" id="shimmerMix" min="0" max="0.5" step="0.001"><div class="value" id="vshimmerMix"></div></div>
+      </div>
+
+      <div class="row"><label>Input Trim (dB)</label><input type="range" id="inTrim" min="-24" max="+12" step="0.1"><div class="value" id="vinTrim"></div></div>
+      <div class="row"><label>Output Ceiling (dB)</label><input type="range" id="ceiling" min="-24" max="0" step="0.5"><div class="value" id="vceiling"></div></div>
+      <div class="row"><label>Output</label><input type="range" id="output" min="0" max="1.5" step="0.001"><div class="value" id="voutput"></div></div>
+
+      <div class="row" style="margin-top:8px;gap:8px;flex-wrap:wrap">
+        <button class="btn primary" id="rec">● 録音</button>
+        <button class="btn" id="clearRec" title="録音バッファ消去">クリア</button>
+        <a class="btn" id="download" download="recording.wav">WAV保存</a>
+        <button class="btn" id="savePreset">プリセット保存</button>
+        <select id="presetSel">
+          <option value="0">Blue Air Plate</option>
+          <option value="1">Glass Shimmer</option>
+          <option value="2">Clean Room</option>
+          <option value="3">Spring-ish Film</option>
+          <option value="4">Wide Hall</option>
+        </select>
+        <button class="btn" id="loadPreset">読込</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h1>メーター / スペクトラム</h1>
+    <div class="meters">
+      <div>
+        <div class="row"><strong>Input VU</strong><div class="value" id="vinVU">-∞ dB</div></div>
+        <canvas id="inMeter" width="600" height="140"></canvas>
+      </div>
+      <div>
+        <div class="row"><strong>Output VU</strong><div class="value" id="voutVU">-∞ dB</div></div>
+        <canvas id="outMeter" width="600" height="140"></canvas>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <div class="row"><strong>Output Spectrum</strong></div>
+      <canvas id="spectrum" width="1200" height="160"></canvas>
+    </div>
+    <small class="hint">
+      ・Early：素数系タップ＋小オールパス2段 / ・Late：8FDN（Hadamard/LP/LowShelf/LFO）<br>
+      ・True-Stereoデコリレーション / ・Shimmer：簡易グラニュラー（late注入のみ）<br>
+      ・補間≥30ms, DCブロック, デノーマル対策, ソフトリミッタ
+    </small>
+  </section>
+</div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+function logErr(msg){ const el=$('errlog'); el.textContent = (el.textContent? el.textContent+'\\n':'') + msg; console.warn(msg) }
+window.addEventListener('error', (e)=> logErr('ERROR: '+ e.message));
+
+let ac, inAnalyser, outAnalyser, outAnalyserFft, master, meterGain, workletOK=false, reverb, recorderNode, mediaStream, fileSource, sourceNode;
+let recording=false, usingMic=true;
+const ui = {
+  srcMic:$('srcMic'), srcFile:$('srcFile'), btnStart:$('btnStart'), btnStop:$('btnStop'), btnReinit:$('btnReinit'),
+  file:$('file'), drop:$('drop'),
+  bypass:$('bypass'), wetOnly:$('wetOnly'),
+  mix:$('mix'), decay:$('decay'), predelay:$('predelay'),
+  lowDamp:$('lowDamp'), highDamp:$('highDamp'), highCut:$('highCut'),
+  modDepth:$('modDepth'), modRate:$('modRate'), width:$('width'), hpf:$('hpf'),
+  shimmerOn:$('shimmerOn'), shimmerAmt:$('shimmerAmt'), shimmerInt:$('shimmerInt'), shimmerMix:$('shimmerMix'),
+  inTrim:$('inTrim'), ceiling:$('ceiling'), output:$('output'),
+  vmix:$('vmix'), vdecay:$('vdecay'), vpredelay:$('vpredelay'),
+  vlowDamp:$('vlowDamp'), vhighDamp:$('vhighDamp'), vhighCut:$('vhighCut'),
+  vmodDepth:$('vmodDepth'), vmodRate:$('vmodRate'), vwidth:$('vwidth'), vhpf:$('vhpf'),
+  vshimmerAmt:$('vshimmerAmt'), vshimmerMix:$('vshimmerMix'), vinTrim:$('vinTrim'), vceiling:$('vceiling'), voutput:$('voutput'),
+  tempoSync:$('tempoSync'), bpm:$('bpm'), division:$('division'), tap:$('tap'),
+  inMeter:$('inMeter'), outMeter:$('outMeter'), spectrum:$('spectrum'), inVU:$('vinVU'), outVU:$('voutVU'),
+  presetSel:$('presetSel'), savePreset:$('savePreset'), loadPreset:$('loadPreset')
+};
+const defaultParams = {mix:0.18, decay:2.8, predelay:35, lowDamp:1.5, highDamp:-2.0, highCut:6000, modDepth:0.8, modRate:0.25, width:0.8, hpf:40, shimmerOn:0, shimmerAmt:0.12, shimmerInt:12, shimmerMix:0.20, output:0.9, bypass:0, wetOnly:0, tempoSync:false, bpm:120, division:'1/8', inTrim:0, ceiling:-6};
+
+// ---- Presets ----
+const presets=[
+  {...defaultParams},
+  {...defaultParams, shimmerOn:1, shimmerAmt:0.12, shimmerInt:12, shimmerMix:0.20, highDamp:-3, highCut:6200, mix:0.22, name:'Glass Shimmer'},
+  {...defaultParams, mix:0.12, decay:1.2, width:0.5, highDamp:-1, lowDamp:0, name:'Clean Room'},
+  {...defaultParams, decay:2.1, modDepth:1.2, modRate:0.35, lowDamp:2.0, highDamp:1.0, mix:0.2, name:'Spring-ish Film'},
+  {...defaultParams, decay:5.2, width:1.0, mix:0.26, modDepth:0.9, highDamp:-4, highCut:7000, name:'Wide Hall'},
+];
+
+// ---- Device enumeration ----
+async function listMics(selectFirst=false){
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const mics = devs.filter(d=>d.kind==='audioinput');
+    const sel = document.getElementById('deviceId');
+    sel.innerHTML = '';
+    mics.forEach(d=>{
+      const o=document.createElement('option');
+      o.value=d.deviceId; o.textContent = d.label || `(マイク)`;
+      sel.appendChild(o);
+    });
+    if(selectFirst && mics.length){ sel.value = mics[0].deviceId }
+  }catch(e){
+    logErr('enumerateDevices失敗: '+(e.name||'')+' '+(e.message||''));
+  }
+}
+$('refreshDevs').addEventListener('click', ()=> listMics(true));
+navigator.mediaDevices?.addEventListener?.('devicechange', ()=>listMics());
+
+// ---- Worklet module (string) ----
+const workletText = `
+class ParamSmooth{ constructor(sr,ms=30){ this.a=Math.exp(-1/(sr*ms/1000)); this.y=0; this.t=0 } setTarget(x){ this.t=x } next(){ this.y=this.a*this.y+(1-this.a)*this.t; return this.y } }
+class DCBlock{ constructor(){ this.x1=0; this.y1=0 } process(x){ const y = x - this.x1 + 0.995*this.y1; this.x1=x; this.y1=y; return y } }
+class OnePole{ constructor(type,sr){ this.type=type; this.sr=sr; this.z=0; this.setCut(6000) } setCut(hz){ const x=Math.exp(-2*Math.PI*Math.max(5,Math.min(this.sr*0.45,hz))/this.sr); this.a0=1-x; this.b1=x } process(x){ if(this.type==='lp'){ this.z=this.z+this.a0*(x-this.z); return this.z } else { this._z=(this._z||0)+this.a0*((x-(this._x||0))-(this._z||0)); this._x=x; return this._z } } }
+class TinyShifter{ constructor(sr){ this.sr=sr; this.size=Math.floor(sr*0.08); this.buf=new Float32Array(this.size); this.w=0; this.r1=0; this.r2=this.size/2; this.win=this._w(this.size/2); this.ratio=2; this.mix=0.2 } _w(n){ const w=new Float32Array(n); for(let i=0;i<n;i++){ w[i]=0.5-0.5*Math.cos(2*Math.PI*i/(n-1)) } return w } setSemi(semi){ this.ratio=Math.pow(2, semi/12) } setMix(m){ this.mix=m } _read(pos){ const N=this.size; let i=pos|0,f=pos-i; if(i<0) i+=N; const i0=i%N,i1=(i0+1)%N; return (1-f)*this.buf[i0]+f*this.buf[i1] } process(x){ const N=this.size,half=N>>1; this.buf[this.w]=x; const inc=1/this.ratio; let y1=this._read(this.r1), y2=this._read(this.r2); y1*=this.win[(this.r1%half)|0]; y2*=this.win[(this.r2%half)|0]; const y=(y1+y2)*this.mix; this.w=(this.w+1)%N; this.r1+=inc; this.r2+=inc; if(this.r1>=half) this.r1-=half; if(this.r2>=N) this.r2-=half; return y } }
+function had8(v){ let a0=v[0]+v[1], a1=v[0]-v[1], a2=v[2]+v[3], a3=v[2]-v[3]; let a4=v[4]+v[5], a5=v[4]-v[5], a6=v[6]+v[7], a7=v[6]-v[7]; let b0=a0+a2, b1=a1+a3, b2=a0-a2, b3=a1-a3; let b4=a4+a6, b5=a5+a7, b6=a4-a6, b7=a5-a7; v[0]=b0+b4; v[1]=b1+b5; v[2]=b2+b6; v[3]=b3+b7; v[4]=b0-b4; v[5]=b1-b5; v[6]=b2-b6; v[7]=b3-b7; const s=1/Math.sqrt(8); for(let i=0;i<8;i++) v[i]*=s; return v }
+class ReverbProcessor extends AudioWorkletProcessor{
+  static get parameterDescriptors(){ const p=(n,min,max,def)=>({name:n, defaultValue:def, minValue:min, maxValue=max, automationRate:'k-rate'}); return [p('mix',0,1,0.18),p('decay',0.3,15,2.8),p('predelay',0,0.25,0.035),p('lowDamp',-12,12,1.5),p('highDamp',-12,12,-2.0),p('highCut',3000,10000,6000),p('modDepth',0,0.01,0.0008),p('modRate',0.05,1.5,0.25),p('width',0,1,0.8),p('hpf',20,200,40),p('shimmerOn',0,1,0),p('shimmerAmt',0,0.5,0.12),p('shimmerSemi',-24,24,12),p('shimmerMix',0,0.5,0.2),p('output',0,1.5,0.9),p('wetOnly',0,1,0),p('bypass',0,1,0) ] }
+  constructor(){ super(); const sr=sampleRate; this.earlyTapsL=[7,11,13,17,19,23,29,31,37,41].map(ms=>Math.round(ms*sr/1000)); this.earlyTapsR=[8,12,14,18,20,24,30,32,38,43].map(ms=>Math.round(ms*sr/1000)); this.earlyBufL=new Float32Array(Math.max(...this.earlyTapsL)+1024); this.earlyBufR=new Float32Array(Math.max(...this.earlyTapsR)+1024); this.eW=0; this.ap1={z:0,g:0.6}; this.ap2={z:0,g:0.5}; const ms=[31,37,43,47,53,59,61,71]; this.n=8; this.len=ms.map(m=>Math.round(m*sr/1000)); this.buf=Array.from({length:this.n},(_,i)=>new Float32Array(this.len[i]+512)); this.w=new Int32Array(this.n); this.lfoP=new Float32Array(this.n); this.lfoR=new Float32Array(this.n); for(let i=0;i<this.n;i++){ this.lfoP[i]=Math.random()*Math.PI*2; this.lfoR[i]=(0.2+Math.random()*0.2) } this.smooth={mix:new ParamSmooth(sr,30),decay:new ParamSmooth(sr,30),pred:new ParamSmooth(sr,30),low:new ParamSmooth(sr,50),high:new ParamSmooth(sr,50),hicut:new ParamSmooth(sr,50),depth:new ParamSmooth(sr,50),rate:new ParamSmooth(sr,50),width:new ParamSmooth(sr,30),hpf:new ParamSmooth(sr,30),shOn:new ParamSmooth(sr,30),shAmt:new ParamSmooth(sr,50),shSemi:new ParamSmooth(sr,50),shMix:new ParamSmooth(sr,50),out:new ParamSmooth(sr,30),wetOnly:new ParamSmooth(sr,20),bypass:new ParamSmooth(sr,20)}; this.dcL=new DCBlock(); this.dcR=new DCBlock(); this.hpfL=this.mkHPF(40); this.hpfR=this.mkHPF(40); this.lpf=new OnePole('lp',sr); this.lpf.setCut(6000); this.lowShelfGain=10**(1.5/20); this.feedbackG=new Float32Array(this.n); this.updateFeedbackG(2.8); this.shifterL=new TinyShifter(sr); this.shifterR=new TinyShifter(sr); this.shifterL.setSemi(12); this.shifterR.setSemi(12); this.preL=new Float32Array(Math.round(0.25*sr)+8); this.preR=new Float32Array(Math.round(0.25*sr)+8); this.preW=0; this.env=0 }
+  mkHPF(hz){ const sr=sampleRate,c=Math.tan(Math.PI*hz/sr); const a1=(1-c)/(1+c), b0=1/(1+c), b1=-b0; return {a1,b0,b1,z:0,y:0,process(x){ const y=b0*x+b1*this.z-a1*this.y; this.z=x; this.y=y; return y }} }
+  updateFeedbackG(T60){ const sr=sampleRate; for(let i=0;i<this.n;i++){ const L=this.len[i]; this.feedbackG[i]=Math.pow(10, -3*(L/sr)/Math.max(0.3,T60)) } }
+  allpass(y,ap){ const x=y + (-ap.g)*ap.z; const out = ap.z + ap.g*x; ap.z=x; return out }
+  process(inputs, outputs, parameters){
+    const input=inputs[0]; const output=outputs[0]; const L=input[0]||new Float32Array(output[0].length); const R=(input[1]||input[0])||new Float32Array(output[0].length);
+    const outL=output[0], outR=output[1]||output[0]; const N=outL.length, sr=sampleRate;
+    const p=(n)=> (parameters[n].length>1? parameters[n] : [parameters[n][0]]);
+    const mixT=p('mix')[0],decayT=p('decay')[0],predT=p('predelay')[0],lowT=p('lowDamp')[0],highT=p('highDamp')[0],hicutT=p('highCut')[0],depthT=p('modDepth')[0],rateT=p('modRate')[0],widthT=p('width')[0],hpfT=p('hpf')[0],shOnT=p('shimmerOn')[0],shAmtT=p('shimmerAmt')[0],shSemiT=p('shimmerSemi')[0],shMixT=p('shimmerMix')[0],outGT=p('output')[0],wetOnlyT=p('wetOnly')[0],bypassT=p('bypass')[0];
+    this.smooth.mix.setTarget(mixT); this.smooth.decay.setTarget(decayT); this.smooth.pred.setTarget(predT); this.smooth.low.setTarget(lowT); this.smooth.high.setTarget(highT); this.smooth.hicut.setTarget(hicutT); this.smooth.depth.setTarget(depthT); this.smooth.rate.setTarget(rateT); this.smooth.width.setTarget(widthT); this.smooth.hpf.setTarget(hpfT); this.smooth.shOn.setTarget(shOnT); this.smooth.shAmt.setTarget(shAmtT); this.smooth.shSemi.setTarget(shSemiT); this.smooth.shMix.setTarget(shMixT); this.smooth.out.setTarget(outGT); this.smooth.wetOnly.setTarget(wetOnlyT); this.smooth.bypass.setTarget(bypassT);
+    const pred=Math.min(0.25,Math.max(0,this.smooth.pred.next())); const predSamples=Math.floor(pred*sr);
+    if((this._dec||0)!==decayT){ this.updateFeedbackG(decayT); this._dec=decayT }
+    this.hpfL=this.mkHPF(Math.max(20,Math.min(200,this.smooth.hpf.next()))); this.hpfR=this.mkHPF(Math.max(20,Math.min(200,this.smooth.hpf.next())));
+    this.lpf.setCut(Math.max(3000,Math.min(10000,this.smooth.hicut.next()))); this.lowShelfGain=Math.pow(10,this.smooth.low.next()/20); const highGain=Math.pow(10,this.smooth.high.next()/20);
+    const shEnable=this.smooth.shOn.next()>0.5; const shMix=this.smooth.shMix.next(); this.shifterL.setSemi(this.smooth.shSemi.next()); this.shifterR.setSemi(this.smooth.shSemi.next()); this.shifterL.setMix(shMix); this.shifterR.setMix(shMix);
+    const depth=this.smooth.depth.next(); const rate=this.smooth.rate.next(); const width=this.smooth.width.next(); const mix=this.smooth.mix.next(); const outG=this.smooth.out.next(); const wetOnly=this.smooth.wetOnly.next()>0.5; const bypass=this.smooth.bypass.next()>0.5;
+    for(let n=0;n<N;n++){
+      const inL=this.hpfL.process(L[n]||0), inR=this.hpfR.process(R[n]||0);
+      this.preL[this.preW]=inL; this.preR[this.preW]=inR; let rP=this.preW - predSamples; if(rP<0) rP+=this.preL.length; const preOutL=this.preL[rP], preOutR=this.preR[rP]; this.preW=(this.preW+1)%this.preL.length;
+      this.earlyBufL[this.eW]=preOutL; this.earlyBufR[this.eW]=preOutR; let earlyL=0,earlyR=0;
+      for(let i=0;i<this.earlyTapsL.length;i++){ let r=this.eW - this.earlyTapsL[i]; if(r<0) r+=this.earlyBufL.length; earlyL += this.earlyBufL[r]*0.08 }
+      for(let i=0;i<this.earlyTapsR.length;i++){ let r=this.eW - this.earlyTapsR[i]; if(r<0) r+=this.earlyBufR.length; earlyR += this.earlyBufR[r]*0.08 }
+      this.eW=(this.eW+1)%this.earlyBufL.length;
+      const ap1=this.ap1, ap2=this.ap2;
+      earlyL = (ap1.z + ap1.g*(earlyL + (-ap1.g)*ap1.z)); ap1.z = earlyL;
+      earlyL = (ap2.z + ap2.g*(earlyL + (-ap2.g)*ap2.z)); ap2.z = earlyL;
+      earlyR = (ap1.z + ap1.g*(earlyR + (-ap1.g)*ap1.z)); ap1.z = earlyR;
+      earlyR = (ap2.z + ap2.g*(earlyR + (-ap2.g)*ap2.z)); ap2.z = earlyR;
+
+      const v=new Float32Array(this.n);
+      for(let i=0;i<this.n;i++){ const len=this.len[i], b=this.buf[i]; const mod = depth*sampleRate*Math.sin(this.lfoP[i]); this.lfoP[i]+= (2*Math.PI*(rate*(0.9+0.2*this.lfoR[i])))/sampleRate; if(this.lfoP[i]>Math.PI*2) this.lfoP[i]-=Math.PI*2; let r=this.w[i] - (len+mod); while(r<0) r+=b.length; const i0=r|0, i1=(i0+1)%b.length, frac=r-i0; v[i]=b[i0]*(1-frac)+b[i1]*frac }
+      const outVecL=[+1,+1,-1,+1,-1,+1,-1,-1], outVecR=[+1,-1,+1,+1,-1,-1,+1,-1];
+      const m=had8(v.slice()); let Lsum=0,Rsum=0, shimmerFeed=0; const M=(preOutL+preOutR+earlyL+earlyR)*0.5, S=(preOutL-preOutR+earlyL-earlyR)*0.5; const inLto=M+S*width, inRto=M-S*width;
+      for(let i=0;i<this.n;i++){ let fb=m[i]*this.feedbackG[i]; fb=this.lpf.process(fb)*highGain; fb*=this.lowShelfGain; const drive=((i&1)? inLto : inRto)*0.18; const b=this.buf[i]; this.w[i]=(this.w[i]+1)%b.length; b[this.w[i]]=fb+drive+1e-24; Lsum+=v[i]*outVecL[i]; Rsum+=v[i]*outVecR[i]; shimmerFeed += v[i]*0.125 }
+      let shL=0, shR=0; if(shEnable){ this._shL=this._shL||new TinyShifter(sampleRate); this._shR=this._shR||new TinyShifter(sampleRate); this._shL.setSemi(parameters.shimmerSemi[0]); this._shR.setSemi(parameters.shimmerSemi[0]); this._shL.setMix(parameters.shimmerMix[0]); this._shR.setMix(parameters.shimmerMix[0]); shL=this._shL.process(shimmerFeed*shAmtT); shR=this._shR.process(shimmerFeed*shAmtT) }
+      let wetL=(Lsum*0.18+earlyL)+shL, wetR=(Rsum*0.18+earlyR)+shR; const dryL=L[n]||0, dryR=R[n]||0;
+      let outl,outr; if(bypass){ outl=dryL; outr=dryR } else if(wetOnly){ outl=wetL; outr=wetR } else { outl=dryL*(1-mix)+wetL*mix; outr=dryR*(1-mix)+wetR*mix }
+      const abs=Math.max(Math.abs(outl),Math.abs(outr)); const atk=0.003, rel=0.08; this.env += (abs>this.env? (abs-this.env)*atk : (abs-this.env)*rel); const th=0.95,knee=0.2; let g=1; if(this.env>th){ const x=(this.env-th)/knee; g=1/(1+x) } const outG=this.smooth.out.next(); outL[n]=outl*outG*g; outR[n]=outr*outG*g;
+    }
+    if((this._c=this._c?this._c+1:1)%10===0){ let rmsL=0,rmsR=0; for(let i=0;i<N;i++){ rmsL+=outL[i]*outL[i]; rmsR+=outR[i]*outR[i] } this.port.postMessage({cmd:'meter',rmsL:Math.sqrt(rmsL/N), rmsR:Math.sqrt(rmsR/N)}) }
+    return true;
+  }
+}
+registerProcessor('reverb-processor', ReverbProcessor);
+class RecorderProcessor extends AudioWorkletProcessor{ constructor(){ super(); this.port.onmessage=e=>{ if(e.data?.cmd==='reset'){ this._buf=[] } } } process(inputs){ const ch0=inputs[0][0]||new Float32Array(128); const ch1=inputs[0][1]||inputs[0][0]||new Float32Array(128); this.port.postMessage({cmd:'chunk',L:ch0.slice(0),R:ch1.slice(0)}, [ch0.buffer.slice(0), ch1.buffer.slice(0)]); return true } }
+registerProcessor('recorder-processor', RecorderProcessor);
+`;
+
+// ---- Init / Re-init ----
+async function ensureAC(){
+  if(!ac){
+    try{ ac = new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive', sampleRate:48000}); }
+    catch(e){ logErr('AudioContext作成失敗: '+e.message); throw e }
+    master=ac.createGain(); master.connect(ac.destination);
+    inAnalyser=ac.createAnalyser(); outAnalyser=ac.createAnalyser(); outAnalyserFft=ac.createAnalyser();
+    inAnalyser.fftSize=2048; outAnalyser.fftSize=2048; outAnalyserFft.fftSize=2048;
+    $('workletStatus').textContent='AudioContext準備完了（入力開始でルーティング）';
+    drawMeters();
+  }
+  if(ac.state==='suspended'){ try{ await ac.resume() }catch{} }
+  return true;
+}
+async function initGraph(){
+  await ensureAC();
+  // Try worklet with timeout; then fallback
+  try{
+    const blob=new Blob([workletText],{type:'application/javascript'});
+    const url=URL.createObjectURL(blob);
+    const addPromise = (ac.audioWorklet && ac.audioWorklet.addModule) ? ac.audioWorklet.addModule(url) : Promise.reject(new Error('AudioWorklet未対応'));
+    const timeout = new Promise((_,rej)=> setTimeout(()=> rej(new Error('AudioWorklet addModule timeout')), 2000));
+    await Promise.race([addPromise, timeout]);
+    // Build nodes
+    reverb = new AudioWorkletNode(ac, 'reverb-processor', {numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[2]});
+    recorderNode = new AudioWorkletNode(ac, 'recorder-processor', {numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[2]});
+    meterGain = ac.createGain(); meterGain.gain.value=1.0;
+    reverb.connect(meterGain).connect(outAnalyser); meterGain.connect(outAnalyserFft); meterGain.connect(recorderNode).connect(master);
+    reverb.port.onmessage = (e)=>{ if(e.data?.cmd==='meter'){ updateVU(e.data.rmsL, e.data.rmsR) } };
+    recorderNode.port.onmessage = onRecChunk;
+    workletOK = true;
+    $('workletStatus').textContent='AudioWorklet: OK（高品質処理）'; $('workletDot').classList.remove('bad'); $('workletDot').classList.add('ok');
+  }catch(err){
+    workletOK=false; $('workletStatus').textContent='Worklet不可またはタイムアウト → 簡易フォールバック'; $('workletDot').classList.add('bad'); buildFallbackReverb(); logErr('Worklet失敗: '+(err.name||'')+' '+(err.message||''));
+  }
+  applyParamsToNode(readParamsFromUI());
+}
+
+let fbNodes={};
+function buildFallbackReverb(){
+  const input=ac.createGain();
+  const trim=ac.createGain(); trim.gain.value=dbToLin(defaultParams.inTrim);
+  input.connect(trim);
+  // Stereo width by M/S
+  const splitter=ac.createChannelSplitter(2), m=ac.createGain(), s=ac.createGain();
+  trim.connect(splitter); splitter.connect(m,0); splitter.connect(m,1); m.gain.value=0.5; splitter.connect(s,0); splitter.connect(s,1); s.gain.value=0.5;
+  const width=ac.createGain(); s.connect(width);
+  const mSum=ac.createGain(), sSumL=ac.createGain(), sSumR=ac.createGain();
+  m.connect(mSum); width.connect(sSumL); width.connect(sSumR); sSumR.gain.value*=-1;
+
+  // Simple reverberator core (Schroeder-ish safe)
+  const combTimes=[0.0297,0.0371,0.0411,0.0437];
+  const combs=combTimes.map(t=>{ const d=ac.createDelay(0.5); d.delayTime.value=t; const g=ac.createGain(); g.gain.value=0.6; const sum=ac.createGain(); sum.connect(d); d.connect(g); g.connect(sum); m.connect(sum); return {out:sum} });
+  const ap1=ac.createBiquadFilter(); ap1.type='allpass'; ap1.frequency.value=900; ap1.Q.value=0.7;
+  const ap2=ac.createBiquadFilter(); ap2.type='allpass'; ap2.frequency.value=700; ap2.Q.value=0.7;
+  const wet=ac.createGain(); wet.gain.value=0.25;
+  combs.forEach(c=> c.out.connect(ap1)); ap1.connect(ap2).connect(wet);
+
+  const dry=ac.createGain(); dry.gain.value=0.8;
+  trim.connect(dry);
+
+  const merger=ac.createChannelMerger(2);
+  const mix=ac.createGain(); dry.connect(mix); wet.connect(mix);
+  mix.connect(merger,0,0); mix.connect(merger,0,1);
+
+  const limiter=ac.createDynamicsCompressor();
+  limiter.threshold.value=-9; limiter.knee.value=12; limiter.ratio.value=8; limiter.attack.value=0.003; limiter.release.value=0.08;
+  const ceiling=ac.createGain(); ceiling.gain.value=dbToLin(defaultParams.ceiling);
+  const out=ac.createGain(); out.gain.value=defaultParams.output;
+
+  const tap=ac.createGain(); tap.gain.value=1;
+  merger.connect(tap); tap.connect(limiter).connect(ceiling).connect(out).connect(outAnalyser);
+  out.connect(outAnalyserFft); out.connect(master);
+
+  fbNodes={input,trim,width,dry,wet,mix,limiter,ceiling,out};
+}
+
+// ---- Input ----
+async function startInput(){
+  try{
+    await initGraph();
+    usingMic = ui.srcMic.checked;
+    if(usingMic){
+      const devSel = document.getElementById('deviceId'); const deviceId = devSel && devSel.value ? {exact: devSel.value} : undefined;
+      mediaStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false, channelCount:{ideal:2}, deviceId}, video:false});
+      sourceNode = ac.createMediaStreamSource(mediaStream);
+      $('workletStatus').textContent = '入力デバイス: ' + (mediaStream.getAudioTracks()[0]?.label || '取得OK');
+      listMics();
+    }else{
+      if(!fileSource){ alert('先にファイルを選んでください'); return }
+      sourceNode = fileSource;
+    }
+    const meterSplit=ac.createGain(); sourceNode.connect(meterSplit); meterSplit.connect(inAnalyser);
+    if(workletOK){ meterSplit.connect(reverb) } else { meterSplit.connect(fbNodes.input) }
+  }catch(e){ logErr('マイク取得失敗: '+(e.name||'')+' '+(e.message||'')) }
+}
+function stopInput(){ try{ sourceNode?.disconnect() }catch{}; if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()) } sourceNode=null; mediaStream=null }
+
+// ---- File ----
+ui.drop.addEventListener('click', ()=> ui.file.click());
+ui.file.addEventListener('change', e=>{ const f=e.target.files?.[0]; if(f) loadAudioFile(f) });
+ui.drop.addEventListener('dragover', e=>{ e.preventDefault(); ui.drop.style.borderColor='#8ab4ff' });
+ui.drop.addEventListener('dragleave', e=>{ ui.drop.style.borderColor='#48608d' });
+ui.drop.addEventListener('drop', e=>{ e.preventDefault(); ui.drop.style.borderColor='#48608d'; const f=e.dataTransfer.files?.[0]; if(f) loadAudioFile(f) });
+async function loadAudioFile(f){ await ensureAC(); const arr=await f.arrayBuffer(); const buf=await ac.decodeAudioData(arr.slice(0)); if(fileSource) try{ fileSource.stop() }catch{}; fileSource=ac.createBufferSource(); fileSource.buffer=buf; fileSource.loop=true; fileSource.start(); ui.srcFile.checked=true; ui.srcMic.checked=false; startInput() }
+
+// ---- Params ----
+function readParamsFromUI(){ const p={ mix:+ui.mix.value, decay:+ui.decay.value, predelay:+ui.predelay.value, lowDamp:+ui.lowDamp.value, highDamp:+ui.highDamp.value, highCut:+ui.highCut.value, modDepth:+ui.modDepth.value, modRate:+ui.modRate.value, width:+ui.width.value, hpf:+ui.hpf.value, shimmerOn:ui.shimmerOn.checked?1:0, shimmerAmt:+ui.shimmerAmt.value, shimmerInt:+ui.shimmerInt.value, shimmerMix:+ui.shimmerMix.value, output:+ui.output.value, bypass:ui.bypass.checked?1:0, wetOnly:ui.wetOnly.checked?1:0, tempoSync:ui.tempoSync.checked, bpm:+ui.bpm.value, division:ui.division.value, inTrim:+ui.inTrim.value, ceiling:+ui.ceiling.value }; if(p.tempoSync){ const beatMs = 60000/Math.max(20,Math.min(300,p.bpm)); let mul=0.5; if(p.division==='1/4') mul=1.0; if(p.division==='1/8') mul=0.5; if(p.division==='1/8.') mul=0.75; if(p.division==='1/8t') mul=1/3; p.predelay=Math.min(120,Math.round(beatMs*mul)) } return p }
+function applyParamsToNode(p){
+  ui.vmix.textContent=(p.mix*100).toFixed(1)+'%'; ui.vdecay.textContent=p.decay.toFixed(2)+' s'; ui.vpredelay.textContent=p.predelay+' ms';
+  ui.vlowDamp.textContent=p.lowDamp.toFixed(1)+' dB'; ui.vhighDamp.textContent=p.highDamp.toFixed(1)+' dB'; ui.vhighCut.textContent=Math.round(p.highCut)+' Hz';
+  ui.vmodDepth.textContent=p.modDepth.toFixed(2)+' ms'; ui.vmodRate.textContent=p.modRate.toFixed(2)+' Hz'; ui.vwidth.textContent=p.width.toFixed(2); ui.vhpf.textContent=Math.round(p.hpf)+' Hz';
+  ui.vshimmerAmt.textContent=(p.shimmerAmt*100).toFixed(1)+'%'; ui.vshimmerMix.textContent=(p.shimmerMix*100).toFixed(1)+'%'; ui.voutput.textContent=p.output.toFixed(2)+'×'; ui.vinTrim.textContent=p.inTrim.toFixed(1)+' dB'; ui.vceiling.textContent=p.ceiling.toFixed(1)+' dB';
+  if(workletOK){ const set=(k,v)=> reverb.parameters.get(k).setValueAtTime(v, ac.currentTime);
+    set('mix',p.mix); set('decay',p.decay); set('predelay',p.predelay/1000); set('lowDamp',p.lowDamp); set('highDamp',p.highDamp); set('highCut',p.highCut);
+    set('modDepth',p.modDepth/1000); set('modRate',p.modRate); set('width',p.width); set('hpf',p.hpf);
+    set('shimmerOn',p.shimmerOn); set('shimmerAmt',p.shimmerAmt); set('shimmerSemi',p.shimmerInt); set('shimmerMix',p.shimmerMix);
+    set('output',p.output); set('wetOnly',p.wetOnly); set('bypass',p.bypass);
+  }else if(fbNodes.input){
+    fbNodes.trim.gain.value = dbToLin(p.inTrim);
+    fbNodes.width.gain.value = p.width;
+    fbNodes.dry.gain.value=(p.bypass?1:(1-p.mix))*0.8; fbNodes.wet.gain.value=(p.bypass?0:p.mix)*0.25;
+    fbNodes.ceiling.gain.value = dbToLin(p.ceiling); fbNodes.out.gain.value=p.output;
+  }
+}
+['mix','decay','predelay','lowDamp','highDamp','highCut','modDepth','modRate','width','hpf','shimmerAmt','shimmerMix','output','inTrim','ceiling'].forEach(k=> ui[k].addEventListener('input', ()=>applyParamsToNode(readParamsFromUI())));
+['bypass','wetOnly','shimmerOn','tempoSync'].forEach(k=> ui[k].addEventListener('change', ()=>applyParamsToNode(readParamsFromUI())));
+ui.bpm.addEventListener('input', ()=>applyParamsToNode(readParamsFromUI())); ui.division.addEventListener('change', ()=>applyParamsToNode(readParamsFromUI()));
+
+// ---- TAP Tempo ----
+let taps=[]; ui.tap.addEventListener('click', ()=>{ const now=performance.now(); taps=taps.filter(t=> now-t<3000); taps.push(now); if(taps.length>=4){ const intervals=[]; for(let i=1;i<taps.length;i++) intervals.push(taps[i]-taps[i-1]); const avg=intervals.reduce((a,b)=>a+b,0)/intervals.length; const bpm=Math.min(300,Math.max(20, 60000/avg)); ui.bpm.value=Math.round(bpm); applyParamsToNode(readParamsFromUI()) } });
+
+// ---- Recording ----
+let recL=[], recR=[], recLen=0;
+function onRecChunk(e){ if(!recording) return; const L=new Float32Array(e.data.L), R=new Float32Array(e.data.R); recL.push(L); recR.push(R); recLen += L.length }
+function toggleRecord(){ recording=!recording; $('rec').textContent = recording? '■ 停止' : '● 録音'; if(!recording){ const url=URL.createObjectURL(new Blob([encodeWav(recL,recR,ac.sampleRate)],{type:'audio/wav'})); const a=$('download'); a.href=url; a.download=`sokyu_${new Date().toISOString().replace(/[:.]/g,'-')}.wav` } else { recL=[]; recR=[]; recLen=0; recorderNode?.port.postMessage({cmd:'reset'}) } }
+$('rec').addEventListener('click', toggleRecord); $('clearRec').addEventListener('click', ()=>{ recL=[]; recR=[]; recLen=0; $('download').removeAttribute('href') });
+function encodeWav(chL,chR,sr){ const len=recLen; const buf=new ArrayBuffer(44+len*4); const dv=new DataView(buf); const ws=(o,s)=>{ for(let i=0;i<s.length;i++) dv.setUint8(o+i,s.charCodeAt(i)) }; ws(0,'RIFF'); dv.setUint32(4,36+len*4,true); ws(8,'WAVE'); ws(12,'fmt '); dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,2,true); dv.setUint32(24,sr,true); dv.setUint32(28,sr*4,true); dv.setUint16(32,4,true); dv.setUint16(34,16,true); ws(36,'data'); dv.setUint32(40,len*4,true); let off=44; for(let b=0;b<chL.length;b++){ const L=chL[b], R=chR[b]; for(let i=0;i<L.length;i++){ const l=Math.max(-1,Math.min(1,L[i])); const r=Math.max(-1,Math.min(1,R[i])); dv.setInt16(off,(l<0?l*32768:l*32767)|0,true); off+=2; dv.setInt16(off,(r<0?r*32768:r*32767)|0,true); off+=2 } } return buf }
+
+// ---- Meters ----
+function db(x){ return (x<=1e-8)? -80 : 20*Math.log10(x) }
+function updateVU(rmsL,rmsR){ ui.outVU.textContent = `${db(Math.sqrt((rmsL*rmsL+rmsR*rmsR)/2)).toFixed(1)} dB` }
+function drawMeters(){
+  if(!inAnalyser){ requestAnimationFrame(drawMeters); return }
+  const inCtx=ui.inMeter.getContext('2d'), outCtx=ui.outMeter.getContext('2d'), spCtx=ui.spectrum.getContext('2d');
+  const W=ui.inMeter.width, H=ui.inMeter.height;
+  const tIn=new Uint8Array(inAnalyser.fftSize); inAnalyser.getByteTimeDomainData(tIn);
+  let rms=0; for(let i=0;i<tIn.length;i++){ const v=(tIn[i]-128)/128; rms+=v*v } rms=Math.sqrt(rms/tIn.length);
+  ui.inVU.textContent=`${db(rms).toFixed(1)} dB`; inCtx.clearRect(0,0,W,H); inCtx.fillStyle='#14213a'; inCtx.fillRect(0,0,W,H); inCtx.fillStyle='#3a7bd5'; inCtx.fillRect(0, H-(Math.min(1,rms)*H), W, H);
+  const tOut=new Uint8Array(outAnalyser.fftSize); outAnalyser.getByteTimeDomainData(tOut);
+  let rms2=0; for(let i=0;i<tOut.length;i++){ const v=(tOut[i]-128)/128; rms2+=v*v } rms2=Math.sqrt(rms2/tOut.length);
+  outCtx.clearRect(0,0,W,H); outCtx.fillStyle='#14213a'; outCtx.fillRect(0,0,W,H); outCtx.fillStyle='#9ef0a8'; outCtx.fillRect(0, H-(Math.min(1,rms2)*H), W, H);
+  const N=outAnalyserFft.frequencyBinCount; const spec=new Uint8Array(N); outAnalyserFft.getByteFrequencyData(spec);
+  spCtx.clearRect(0,0,ui.spectrum.width,ui.spectrum.height); spCtx.fillStyle='#0e1220'; spCtx.fillRect(0,0,ui.spectrum.width,ui.spectrum.height); spCtx.strokeStyle='#66aaff'; spCtx.beginPath();
+  for(let i=0;i<N;i++){ const x=i/N*ui.spectrum.width; const y=ui.spectrum.height - (spec[i]/255)*ui.spectrum.height; if(i===0) spCtx.moveTo(x,y); else spCtx.lineTo(x,y) } spCtx.stroke();
+  requestAnimationFrame(drawMeters);
+}
+
+// ---- Preset save/load (localStorage) ----
+function getCurrentParams(){ return readParamsFromUI() }
+function loadPresetObj(p){ for(const k in p){ if(ui[k] && typeof ui[k].value!=='undefined'){ if(ui[k].type==='checkbox') ui[k].checked = !!p[k]; else ui[k].value = p[k] } } applyParamsToNode(readParamsFromUI()) }
+ui.savePreset.addEventListener('click', ()=>{ const idx=+ui.presetSel.value; localStorage.setItem('sokyu_preset_'+idx, JSON.stringify(getCurrentParams())); alert('保存しました（スロット '+(idx+1)+'）') });
+ui.loadPreset.addEventListener('click', ()=>{ const idx=+ui.presetSel.value; const s=localStorage.getItem('sokyu_preset_'+idx); if(s){ loadPresetObj(JSON.parse(s)) } else { loadPresetObj(presets[idx]||defaultParams) } });
+
+// ---- Hotkeys ----
+document.addEventListener('keydown', (e)=>{
+  if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT' || e.target.tagName==='TEXTAREA') return;
+  if(e.code==='Space'){ e.preventDefault(); ui.bypass.checked=!ui.bypass.checked; applyParamsToNode(readParamsFromUI()) }
+  if(e.key==='r' || e.key==='R'){ toggleRecord() }
+  if(e.key==='s' || e.key==='S'){ ui.shimmerOn.checked=!ui.shimmerOn.checked; applyParamsToNode(readParamsFromUI()) }
+  if('12345'.includes(e.key)){ ui.presetSel.value=String(+e.key-1); ui.loadPreset.click() }
+});
+
+// ---- Helpers ----
+function dbToLin(db){ return Math.pow(10, db/20) }
+
+// ---- Bindings ----
+ui.btnStart.addEventListener('click', startInput);
+ui.btnStop.addEventListener('click', stopInput);
+ui.btnReinit.addEventListener('click', ()=>{ try{ stopInput(); reverb?.disconnect(); recorderNode?.disconnect(); reverb=null; recorderNode=null; workletOK=false; initGraph() }catch(e){ logErr('再初期化失敗:'+e.message) } });
+document.getElementById('refreshDevs').addEventListener('click', ()=> listMics(true));
+
+// ---- Boot ----
+(function boot(){
+  // defaults
+  for(const [k,v] of Object.entries(defaultParams)){ if(ui[k]){ if(ui[k].type==='checkbox') ui[k].checked=!!v; else ui[k].value=v } }
+  ui.bpm.value=defaultParams.bpm; ui.division.value=defaultParams.division;
+  applyParamsToNode(readParamsFromUI()); listMics(); // ACは入力開始時に作成
+  $('workletStatus').textContent='待機中：入力開始でルーティング＆解析開始';
+  requestAnimationFrame(drawMeters);
+})();
+</script>
+</body>
+</html>
